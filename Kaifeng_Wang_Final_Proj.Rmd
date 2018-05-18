@@ -1,0 +1,388 @@
+---
+title: "Predicting IMDB Ratings of Over 5000 Different Movies"
+author: "Kaifeng Wang"
+date: "May 18, 2018"
+output: html_document
+---
+
+# Introduction
+
+Did you ever wonder which factors played the biggest role in how highly a movie is rated? Especially with the recent trend of superhero movies, it's easy to believe that movies only require a high budget or a popular staff to succeed at the box office. In this tutorial, I will aim to prove exactly that: given what we know, how reliably can we predict how well a movie will be rated on sites like IMDB? I will walk us through the data acquisition/management, then look at some exploratory data analysis, and finally use machine learning to try and predict imdb ratings.
+
+## Required Packages
+
+I'm using the latest version of RStudio to write my code. If you don't know what that is, here is where you can download the software and learn more about what it can do: https://www.rstudio.com/  
+You're going to want to install these packages for our program to work:  
+```{r setup, include=TRUE}
+# Packages we will need
+library(broom)     # Data Manipulation
+library(tidyverse) # Data manipulation
+library(lubridate) # Converting datetime
+library(dplyr)     # Data manipulation
+library(ggplot2)   # graphing
+library(ggrepel)   # Visualization
+library(randomForest) # Machine learning
+```
+
+# Data Curation
+
+The dataset I'm using is a set of over 5000 IMDB movie data scraped from the IMDB website. The data is hosted by @Data-Society at Data.World, which you can download here: https://data.world/data-society/imdb-5000-movie-dataset  
+We will then use the read_csv function to read our .csv file into RStudio, and convert it to a useable data frame.  
+
+```{r, echo=T}
+
+data <- read_csv("movie_metadata.csv")
+as_tibble(data)
+
+```
+
+A lot of columns are cut off here, so let's try to get some more detail about these attributes:  
+
+```{r}
+
+str(data)
+
+```
+
+We've got an idea of what kind of data we're working with: whether the film is in color, the director's name, how many likes it got on Facebook, etc. Now let's try to clean up some of these entries. 
+
+## Tidying our Data 
+
+We have quite a few missing values in a lot of places, which won't bode well for our machine learning algorithm. 
+```{r}
+
+sapply(data, function(x) sum(is.na(x)))
+
+```
+
+Since this is such a large dataset, omitting these entries is the way to go here. Most entries have more than one missing value, and it would be too difficult to try and fill these in ourselves.  
+
+```{r}
+data <- data %>%
+  # omit entries containing missing values
+  na.omit() 
+```
+
+There are way too many attributes to make use of in this single tutorial. We'd like to get rid of a lot of these, to make it easier to understand what we're working with.  
+
+```{r}
+data <- data %>%
+  select(-plot_keywords) %>%          # Just some keywords about the movie
+  select(-country) %>%                # We won't be using Country movie was made in
+  select(-actor_2_facebook_likes) %>% # We already have total cast facebook likes, anyway
+  select(-actor_3_facebook_likes) %>%
+  select(-actor_2_name) %>%           # We won't deal with secondary actors (for now)
+  select(-actor_3_name) %>%
+  select(-movie_imdb_link) %>%        # Definitely don't need the IMDB link to the movie
+  select(-content_rating) %>%         # We won't use the movie's content rating
+  select(-num_critic_for_reviews) %>% # Number of user/critic reviewers doesn't pertain to us
+  select(-num_user_for_reviews) %>%   
+  select(-aspect_ratio) %>%           # Don't need the aspect ratio of the movie
+  select(-language)                   # We won't do anything concerning the language of the movie
+data
+
+```
+
+Great - We've condensed our data quite a bit into only 15 columns. Next, we'll decide how to standardize these values.
+
+## Adjusting for Inflation
+
+Since our range of movies is quite large, it would be inaccurate to compare movie budgets without adjusting for yearly inflation. I've taken another .csv of the monthly Consumer Price Index for All Urban Consumers (CPIAUC) of the past 70 years in America so we can adjust the budget/gross to one year. You can find the dataset from https://fred.stlouisfed.org/series/CPIAUCSL/ and learn more about how the U.S. Bureau of Labor Statistics collects this information.  
+
+```{r}
+
+monthly_inflation <- read_csv("CPIAUCSL.csv")     # Read my .csv dataset
+yearly_inflation <- monthly_inflation %>%
+  mutate(year = year(monthly_inflation$DATE)) %>% # Convert the date into year
+  group_by(year) %>%
+  summarize(rate = mean(CPIAUCSL)) %>%            # Get the yearly average rate for each year
+  mutate(adjustment = rate[year == 2018] / rate)  # Calculate adjustment relative to 2018
+tail(yearly_inflation)                            # Print out the last few years
+
+```
+
+Now we can see the adjustment factor we need to multiply for each year in order to convert it to today's money. Now, we will append this data to our existing table and calculate the new adjusted budgets.  
+
+```{r}
+
+adj_data <- data %>%
+  left_join(yearly_inflation,by=c("title_year"="year")) %>% # Add adjustment to table where years match
+  mutate(adj_budget=budget * adjustment) %>%                # Calculate new adjusted budget/gross
+  mutate(adj_gross=gross * adjustment) %>%
+  select(-budget) %>%                                       # No longer have any need for these columns
+  select(-gross)
+head(adj_data[,c("title_year","movie_title","adjustment","adj_budget","adj_gross")])
+
+```
+
+## Standardize out Data
+
+The last thing we want to do is to normalize the budgets, to get a better range of data for us to work with and make better comparisons. Standardizing is important to account for large changes in data and center/scale our data to a more flexible range. More information about normalization can be found on this simple wikipedia page:  https://en.wikipedia.org/wiki/Normalization_(statistics)  
+
+```{r}
+
+final_data <- adj_data %>%
+  mutate(std_budget = (adj_budget - mean(adj_budget,na.rm=T))/sd(adj_budget,na.rm=T)) %>% # Calculate standardized budget/gross
+  mutate(std_gross = (adj_gross - mean(adj_gross,na.rm=T)) / sd(adj_gross,na.rm=T)) %>%
+  select(-adj_budget) %>% # remove unneeded columns
+  select(-adj_gross) %>%
+  select(-adjustment)
+head(final_data[,c("movie_title","std_budget","std_gross","director_name")])
+
+```
+
+# Exploratory Data Analysis
+
+Now that we've cleaned up our data a little, we can now start doing some analysis. This will allow us to see some obvious trends (or lack of) and get a better sense of what's most important when gauging how well a movie will fare.
+
+# Data over time
+
+Let's look at the distribution of movie ratings over time to see if there are any correlations between rating and year the movie was released. I used a violin plot to show the distributions of data, which in this case is far more interesting than most other data visualizations. You can read up more on violin plots here: https://www.r-graph-gallery.com/violin-plot/  
+
+
+```{r}
+
+final_data %>%
+  filter(title_year >= 2000 & title_year <= 2016) %>%
+  ggplot(aes(x=factor(title_year),y=imdb_score)) +
+  geom_violin() +
+  labs(title="Distributions of IMDB Scores from 2000 to 2016",
+    x = "Year",
+    y = "Score")
+
+```
+
+As you can see, data doesn't seem to change over the years. Most scores are heavily centered at the 7.25 mark, and don't range too much higher than that. What's interesting is that most of the outliers can be found at the bottom of the pack, and each year seems to have a couple glaringly bad movies which skew the data a bit.
+
+# Face Number
+
+An interesting subject that indeed garnered interest concerning this dataset was whether the number of faces on a poster affected how well the movie did. This could be explained by many factors, such as seeing one's favorite actor on the cover. I constructed a mosaic plot by dividing score and face numbers into 3 categories each, and visualizing the distributions of each one compared to each other. More on mosaic plots can be read here: https://www.tutorialgateway.org/mosaic-plot-in-r/  
+
+```{r}
+
+# I grouped IMDB into 3 categories: great, average, and bad
+final_data$rating[final_data$imdb_score >= 8] <- "great"
+final_data$rating[final_data$imdb_score >= 5 & final_data$imdb_score < 8] <- "average"
+final_data$rating[final_data$imdb_score < 5] <- "bad"
+
+# I grouped number of faces into 3 categories as well: None, some, and many
+final_data$facenumberD[final_data$facenumber_in_poster == 0] <- "none"
+final_data$facenumberD[final_data$facenumber_in_poster > 0 & final_data$facenumber_in_poster <= 5] <- "some"
+final_data$facenumberD[final_data$facenumber_in_poster >= 5] <- "many"
+
+mosaicplot(table(final_data$facenumberD,final_data$rating), main="Scores based on face number", shade=TRUE)
+
+```
+
+Again, we see that not too much variation exists among scores solely on face number. We have confirmed that most scores are distributed near the "average" side of data. These graphs are starting to tell us that maybe huge trends in IMDB ratings are pretty uncommon, since we tend to score things all the same on average. 
+
+# Scores vs Money
+
+Let's look at how budget fares in predicting imdb score. We'll use our standardized budget values and make a scatter plot to see the trend of scores on increasing budget sizes. Here, I took the log of the budget because even still, the range of budgets was quite high and needed to be toned down a little.  
+
+```{r}
+final_data %>%
+  ggplot(aes(x=log(std_budget),y=imdb_score)) +
+  geom_point() +
+  geom_smooth(method=lm, fill=NA) +
+  labs(title="Distributions of IMDB Scores Based on Budget",
+    x = "Standardized Budget",
+    y = "Score")
+
+```
+
+There's a slight trend - As budget increases, so does score, which intuitively makes sense. We've learned that we're probably not going to see drastic correlations between many of these factors, but this indeed shows us exactly what we were hoping to expect. We also can see that in fact, some of the higher scoring movies are far from the most expensive ones, which says a lot about how much can be done without expensive machinery, props, actors, etc.
+
+
+# Actors
+
+Another fun factor to look at is how each actor fares against the IMDB rating system. I've only taken some of the more well-known actors on facebook, just to unclutter the data a little and perhaps get a better reading. We'll be able to see the average IMDB score each actor gets, and the distribution of these scores among the main actors. In another project, maybe we could look into how this adds up when including more actors from the same movie. Once again, I took the log of facebook likes beause the range was too large.   
+
+```{r}
+
+parsed <- final_data %>%
+  # Only actors with more than 12000 likes (upper quartile range)
+  filter(actor_1_facebook_likes >= 12000) %>%
+  group_by(actor_1_name) %>%
+  # Compute the mean score of actors
+  summarise(mean_score=mean(imdb_score)) %>%
+  # Get our old attributes back from the previous table
+  inner_join(final_data, actor_1_name=adj_data$actor_1_name) %>%
+  # Remove duplicate entries as a result of joining the table
+  distinct(actor_1_name, .keep_all = T) %>%
+  # Compute an outlier who has an exceedingly good (or bad) score, or one with a significant number of likes
+  mutate(outlier=ifelse(mean_score > 7.5 | mean_score < 5 | actor_1_facebook_likes > 300000, TRUE, FALSE))
+parsed %>%
+  ggplot(aes(x=log(actor_1_facebook_likes),y=mean_score,label=actor_1_name)) +
+    # Assign a color based on whether they're an outlier or not
+    geom_point(color = ifelse(parsed$outlier, "red", "blue"), size = 3) +
+    # Only label those who are outliers
+    geom_label_repel(data = subset(parsed, outlier==TRUE)) +
+    labs(title="Average IMDB Scores for Main Actors of Various Movies",
+      x = "# of Facebook Likes",
+      y = "Score")
+
+```
+
+On average, the actors seem to be well centered around the 6-7 mark. What's interesting is that the more facebook likes, the lower the average rating it seems. It also seems that infamously poor-rated actors maybe be a good indicator of whether the movie will fare poorly or not. 
+
+## Directors
+
+Let's look at directors in the same way we did actors. We'll group them based on how popular they are on facebook as well, so that we can see if more reknowned directors might produce better movies. I used boxplots to visualize the correlation between these too, because it will deliver helpful statistics about the median and upper/lower quartiles. If you've forgotten what a box plot is, you can see a description here: https://www.r-graph-gallery.com/boxplot/  
+
+```{r}
+
+parsed <- final_data %>%
+  group_by(director_name) %>%
+  # Get the mean IMDB score of each director
+  summarise(mean_score = mean(imdb_score),director_facebook_likes=mean(director_facebook_likes)) %>%
+  # Compute whether a director is popular based on the # of facebook likes
+  mutate(popular_director = ifelse(director_facebook_likes > 195, T, F)) %>%
+  # Compute if a director is an outlier or not
+  mutate(outlier = ifelse(mean_score > 8.4 | mean_score < 2.2 | (popular_director & mean_score < 3.1), T, F))
+parsed %>%
+  ggplot(aes(x=popular_director,y=mean_score,label=director_name)) +
+    geom_boxplot() +
+    geom_label_repel(data=subset(parsed, outlier==T)) +
+    labs(title="IMDB Scores of Popular/Unpopular Directors",
+      x = "Popular?",
+      y = "Mean core")
+  
+```
+
+Indeed, more popular directors have a higher influence on how well a movie does. This is a better correlation than just looking purely on actors, and we now know that the director plays a large role in how a movie is received (obviously).
+
+## Genres
+
+Finally, let's look at how different genres play a role in IMDB ratings. We'll only use the main genre of each movie, which can be parsed from the list of genres given. I've created a bar graph of the ratings of each genre, and we can easily compare the main genres available.  
+
+```{r}
+final_data %>%
+  # Isolate the first genre of each list to retrieve the main genre
+  mutate(main_genre = sub("\\|.*", "", genres)) %>%
+  group_by(main_genre) %>%
+  # Calculate the mean score of each genre
+  summarise(mean_score = mean(imdb_score)) %>%
+  ggplot(aes(x=main_genre,y=mean_score)) +
+    # Graph the bars of each genre
+    geom_bar(stat="identity") +
+    # Rotate the bottom labels  
+    theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+    ylim(0,8.5) +
+    # Add the ratings to the top of each bar
+    geom_text(aes(label=round(mean_score,1)),vjust=-0.5) +
+    labs(title="IMDB Scores by Genre",
+      x = "Genre",
+      y = "Mean score")
+
+```
+
+This is very interesting - Western films seem to outrank all other genres by a hefty margin. Thrillers also seem to fare much worse on the scale than any other genre. One could suspect that filtering out one genre from a movie might not be an ideal method to distinguish movies. Further effort could be done into achieving more accurate results.
+
+# Hypothesis Testing and Machine Learning
+
+Let's start to physically compute some trends and get our machine to learn how to predict movie ratings. We'll start with a couple linear regression models, which allow us to create a linear function based on a couple predictors we give it. To learn more about lm models you can see: http://stat.ethz.ch/R-manual/R-devel/library/stats/html/lm.html  
+
+# Hypothesis Testing
+We'll start by looking at two unrelated factors: duration, and facenumber. We need to be careful about picking our predictors because if they are at all related to each other, it may upset the linearity of our model. Even though facenumber we saw did not prove to have much correlation, it'll be useful in contrasting it with other predictors.  
+
+```{r}
+
+# Fit an lm model on duration and facenumber
+fit <- lm(imdb_score~1+duration+facenumber_in_poster,data=final_data)
+fit %>% tidy()
+
+```
+
+Our null hypothesis, as with establishing any relationship, is that *no* relationship can be seen between our scores and predictors.  
+Interestingly, from our data collected, the increasing number of faces on average lowers the score by about 0.0.4 per face. Cluttered posters may have a negative outcome on movie reception, it seems. Duration also has a fairly significant trend - the longer the movie, the higher the rating. These two predictors also have p-values significantly small, meaning we can *reject* our null hypothesis that there is no relationship, and conclude that these factors indeed have an impact on score.  
+Let's also take a look at the anova function. This will spit out an F-value, which basically tells us how significant of a relationship there is between the values and predictors. If it is larger enough than 1, we can conclude that it is significant.  
+
+```{r}
+anova(fit)
+```
+
+Our two factors indeed produce F values larger than 1, and we can see that score is very much dependent on the duration of the movie, which is an especially significant trend.  
+Now, we'll also do another separate lm model for budget. We'll compute the same values we did for the previous model.  
+```{r}
+fit_2 <- lm(imdb_score~std_budget,data=final_data)
+fit_2 %>% tidy()
+anova(fit_2)
+```
+
+We can see that on average, keeping all other parameters constant, the standardized budget increases score by about 0.045. While this may seem like a larger significance than duration, keep in mind this is only one predictor we have used, and the inclusion of more factors would indeed truncate the effectiveness of only one predictor. We still get a p-value which is very small, meaning we can reject our null hypothesis that budget doesn't play a role in determining score. Our p-value indicates that the chances there is no relationship is very very small.  
+Looking at our F-value, we can see that we also get a value that is greater than 1. This helps to confirm the role that budget playes in predicting score.  
+
+# Machine Learning
+
+Finally, let's use our machine to learn about our data, and use it to then predict various score of random movies. We're going to split the data up into testing and training, so that we can use half to learn and the other half to compare our predictions.  
+```{r}
+
+#Two halves of the set: train for use in the random forest, and test for use with prediction
+train <-final_data[1:1867,] %>% na.omit()
+test <- final_data[1877:3752,] %>% na.omit()
+
+```
+
+I am using the *random forest* algorithm to carry out the learning process. The random forest produces decision trees which compile an overall estimate of the score based on the results of each individual tree. More can be learned about this method here: https://cran.r-project.org/web/packages/randomForest/randomForest.pdf  
+I am using a bunch of interesting predictors that I thought would be interesting to see their roles in the prediction process.  
+
+```{r}
+set.seed(1234)
+
+# Compute the random forest, with a variety of predictors
+rf <- randomForest(imdb_score~std_budget+duration+num_voted_users+cast_total_facebook_likes+
+                     facenumber_in_poster+movie_facebook_likes+std_gross,data=train)
+
+plot(rf)
+title("Error Rate of Predicting IMDB Scores using Random Forest")
+```
+
+The more trees, the less our error rate, which makes sense because we would have more data to establish a better prediction. The error rate edges out to well below 0.5, meaning we should be able to predict IMDB scores to within 0.5 of its actual rating.  
+
+We'll now look at the importance of each predictor as it was used in the machine learning. I created a bar graph to represent how each one fares against one another.  
+
+```{r}
+
+# Calculate the importance
+importance <- importance(rf)
+# Construct a data frame for the importance factors
+df <- data_frame(predictors = row.names(importance), Importance=round(importance[,]))
+df
+ggplot(df,aes(x=predictors,y=Importance))+
+  geom_bar(stat="identity") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+  labs(title="Importance Of each Predictor",
+    x = "Predictor",
+    y = "Importance")
+
+```
+
+As seen previously, facenumber indeed does not play a huge role in the criteria for gauging IMDB score. In fact, duration and the number of users voting are what play the largest roles. Unfortunately, the number of IMDB votes doesn't pertain to the actual movie, but this provides great insight as to how these scores come about. Since many user tend to vote similarily, more users means the score will tend towards a more predictable value, which is most likely why this comes in handy so much.  
+
+Finally, let's look at the prediction rates with the other half of the data; I have constructed a scatter plot of the *mean square error* of our predicted vs actual values. 
+```{r}
+
+# Conduct the prediction
+prediction <- predict(rf, test) %>% 
+  data_frame() %>% 
+  # Add a ID number to sync predictions with actual data
+  rowid_to_column("id")
+test %>%
+  mutate(id = seq.int(nrow(test))) %>%
+  # Add predictions to test
+  left_join(prediction,by="id") %>%
+  # Compute the MSA
+  mutate(mse = (imdb_score - .)^2) %>%
+  ggplot(aes(x=id,y=mse)) +
+    geom_point() +
+    labs(title="Mean Square Errors of Test Data",
+      x = "Id",
+      y = "Mean Square Error")
+```
+
+Most of the error rates range very close to 0, which is a great distribution.
+
+# Conclusion
+
+We collected many different factors that helped us to determine the best possible prediction for our IMDB scores. We saw that many of them didn't quite create a noticeable trend in the data, but other fare very well, especially considering how users tend to vote very similarily and the data set was so large. Factors outside the movie, such as the number of IMDB votes, played very significant roles in predicting scores, which intuitively makes sense. Other movie data, such as duration and budget, we saw indeed had roles which one would expect these to have. overall, there is much that can be done in analyzing this dataset, and I've only scratched the surface of the trends and findings available with the movies. 
